@@ -1,0 +1,180 @@
+---
+title: "Differential abundance analysis"
+author: "Kaushik Amancherla"
+date: "2024-03-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(Seurat)
+library(miloDE)
+library(miloR)
+library(SingleCellExperiment)
+library(S4Vectors)
+library(BiocParallel)
+library(ggpubr)
+library(gprofiler2)
+
+# Set working directory
+setwd("C:/Users/amanchk/Downloads/PBMC_CAV_2.2024")
+```
+
+## Load PBMC CAV Seurat object and convert to SCE
+
+Here, I am just loading the object that I previously created. Once loaded, I will convert it to a SingleCellExperiment (SCE) object that can be used for downstream analyses.
+
+```{r}
+# Load Seurat object
+pbmc <- readRDS("Processing_RDS_files/2024_pbmc_ALL_samples_postANNOTATION.rds")
+
+# Rename two metadata columns for easier downstream analyses
+pbmc@meta.data <- pbmc@meta.data %>% dplyr::rename(
+  cluster = predicted.celltype.l1,
+  subcluster = predicted.celltype.l2
+)
+
+# Convert the Seurat object to an SCE object
+pbmc.sce <- as.SingleCellExperiment(pbmc, assay = "RNA")
+pbmc.sce
+
+# Convert to Milo object
+pbmc.milo <- Milo(pbmc.sce)
+pbmc.milo
+```
+
+## Constructing the KNN graph
+
+You can also embed plots, for example:
+
+```{r}
+set.seed(42) # Set seed for reproducibility
+
+# Build the graph
+pbmc.milo.k90 <- buildGraph(pbmc.milo, k = 90, d = 30)
+```
+
+Next, we will define representative neighborhoods:
+```{r}
+pbmc.milo.k90 <- makeNhoods(pbmc.milo.k90, k = 90, d = 30, prop = 0.1, refined = TRUE, reduced_dims = "HARMONY")
+
+# Plot
+plotNhoodSizeHist(pbmc.milo.k90) +
+  scale_x_continuous(limits=c(0, 500))
+```
+
+The majority of neighborhoods have size peaking between 50 and 100, as recommended by miloR.
+
+Now, we count the number of cells in the neighborhoods:
+```{r}
+pbmc.milo.k90 <- countCells(pbmc.milo.k90, meta.data = data.frame(colData(pbmc.milo.k90)), samples="Sample_ID")
+
+# Look at count matrix for DA analysis
+head(nhoodCounts(pbmc.milo.k90))
+```
+
+## Differential abundance testing
+
+First, we create the design for the DA testing. I will use "group" (CAV vs Control) as the covariate.
+
+```{r}
+design <- data.frame(colData(pbmc.milo.k90))[,c("Sample_ID", "high_grade_cav")]
+design <- distinct(design)
+rownames(design) <- design$Sample_ID
+
+# Factor
+design$high_grade_cav <- factor(design$high_grade_cav, levels = c("0", "1"))
+levels(design$high_grade_cav)
+
+## Reorder rownames to match columns of nhoodCounts(milo)
+design <- design[colnames(nhoodCounts(pbmc.milo.k90)), , drop=FALSE]
+
+design
+```
+
+Now, we run DA analysis using condition as the covariate:
+```{r}
+gc()
+pbmc.milo.k90 <- calcNhoodDistance(pbmc.milo.k90, d=30, reduced.dim = "HARMONY")
+pbmc.milo.k90
+
+# saveRDS(pbmc.milo.k90, "Processing_RDS_files/miloR/pbmc.miloR.d30.k90.rds")
+```
+
+Perform the DA analysis:
+```{r}
+da_results <- testNhoods(pbmc.milo.k90, design = ~ high_grade_cav, design.df = design)
+
+# Look at the DA results
+da_results %>%
+  arrange(- SpatialFDR) %>%
+  head()
+
+# Save DA results
+# write_csv(da_results, "Processing_RDS_files/miloR/High_grade_DA_results_6.2.24_k90.csv")
+```
+## Visualization of DA results
+
+First, inspect the DA results:
+```{r}
+ggplot(da_results, aes(PValue)) + geom_histogram(bins=50)
+
+# Volcano plot (each point represents a neighborhood, not cell)
+ggplot(da_results, aes(logFC, -log10(SpatialFDR))) + 
+  geom_point() +
+  geom_hline(yintercept = -log10(0.1)) ## Mark significance threshold (10% FDR)
+```
+
+Next, visualize the DA results:
+```{r}
+pbmc.milo.k90 <- buildNhoodGraph(pbmc.milo.k90)
+
+## Plot single-cell UMAP
+umap_pl <- scater::plotReducedDim(pbmc.milo, dimred = "UMAP", colour_by="subcluster", text_by = "subcluster", 
+                          text_size = 3, point_size=0.5) +
+  guides(fill="none")
+
+## Plot neighbourhood graph
+nh_graph_pl <- plotNhoodGraphDA(pbmc.milo, da_results, layout="UMAP",alpha=0.05) 
+  
+umap_pl + nh_graph_pl +
+  patchwork::plot_layout(guides="collect")
+```
+
+Next, I will plot the DA results according to cell type in an easily-digestible manner:
+```{r}
+# Add cell type annotation
+da_results <- annotateNhoods(pbmc.milo.k90, da_results, coldata_col = "subcluster")
+head(da_results)
+
+# Inspect subcluster fraction
+ggplot(da_results, aes(subcluster_fraction)) + geom_histogram(bins=50)
+# ggsave("Figures/MiloR_subcluster_fraction_distribution_k90.png", dpi = 1200, bg = "white")
+
+# Change class of subcluster column to factor
+da_results$subcluster <- as.factor(da_results$subcluster)
+
+# Visualize
+miloR::plotDAbeeswarm(da_results, group.by = "subcluster")
+# ggsave("Figures/MiloR_high_grade_k90.png", dpi = 1200, bg = "white")
+
+# Use 0.7 as the cut-off
+da_results_cutoff <- da_results
+da_results_cutoff$subcluster <- ifelse(da_results_cutoff$subcluster_fraction < 0.7, "Mixed", da_results_cutoff$subcluster)
+
+
+# Visualize
+miloR::plotDAbeeswarm(da_results_cutoff, group.by = "subcluster")
+# ggsave("Figures/MiloR_high_grade_k90_mixed.png", dpi = 1200, bg = "white")
+```
+
+Further investigation of DA neighborhoods - why do some have both increased and decreased DA in high-grade CAV? This includes CD4 TCM, CD14 and CD16 monocytes
+```{r}
+
+```
+
+Save rds file:
+```{r}
+gc()
+# saveRDS(pbmc.milo, "Processing_RDS_files/miloR/pbmc.milo_high_grade_d30_6.1.24.RDS")
+```

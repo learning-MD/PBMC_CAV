@@ -1,0 +1,726 @@
+---
+title: "Wrangling DE results"
+author: "Kaushik Amancherla"
+date: "2024-04-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(Seurat)
+library(miloDE)
+library(miloR)
+library(SingleCellExperiment)
+library(S4Vectors)
+library(BiocParallel)
+library(ggpubr)
+library(gprofiler2)
+library(viridis)
+library(RColorBrewer)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(DOSE)
+
+# Set working directory
+setwd("C:/Users/amanchk/Downloads/PBMC_CAV_2.2024")
+```
+
+## Load RDS objects from the DE analysis
+
+Here, I will load the DE objects I created using cluster-free DE analysis (miloDE) previously.
+
+```{r}
+# Prednisone vs non-prednisone
+de_stat_pred <- readRDS("Processing_RDS_files/milo_DE/2024_de_stat_prednisone_k30.rds")
+
+# High-grade CAV vs non-high-grade CAV
+de_stat_high_grade <- readRDS("Processing_RDS_files/milo_DE/2024_de_stat_high_grade_k30.rds")
+# write_csv(de_stat_high_grade, "Figures/DE_genes_high_grade_CAV.csv")
+
+# Group (CAV vs non-CAV)
+de_stat_group <- readRDS("Processing_RDS_files/milo_DE/2024_de_stat_group_k30.rds")
+# write_csv(de_stat_group, "Figures/DE_genes_CAV.csv")
+
+# Clear memory
+gc()
+```
+
+## Loading the milo.pbmc RDS object (after assinging neighborhoods)
+
+This will allow me to link the nhoods to celltypes:
+
+```{r}
+# Load object
+milo.pbmc <- readRDS("Processing_RDS_files/milo_DE/2024_miloDE_pbmc_harmony_k30.rds")
+
+# Annotate neighborhoods
+nhoods_sce <- nhoods(milo.pbmc)
+
+# Assign cell types for nhoods 
+nhood_stat_ct <- data.frame(Nhood = 1:ncol(nhoods_sce) , Nhood_center = colnames(nhoods_sce))
+nhood_stat_ct <- miloR::annotateNhoods(milo.pbmc , nhood_stat_ct , coldata_col = "subcluster")
+```
+
+## Visualization
+Include only those genes significant both across genes and across neighborhoods.
+
+High-grade CAV:
+```{r}
+# Joining subcluster info to nhoods
+de_stat_high_grade <- inner_join(de_stat_high_grade, nhood_stat_ct, by = c("Nhood", "Nhood_center"))
+
+# Volcano plot
+ggplot(de_stat_high_grade, aes(x = logFC, y = -log10(pval), color = (pval_corrected_across_genes < 0.05 & pval_corrected_across_nhoods < 0.05))) +
+  geom_point() +
+  ggrepel::geom_text_repel(data = head((de_stat_high_grade %>% arrange(pval_corrected_across_genes)), 20), aes(label = gene)) +
+  cowplot::theme_cowplot() +
+  scale_color_manual(name = "FDR < 0.05", 
+                     values = c("TRUE" = "red", "FALSE" = "black"),
+                     labels = c("Not Significant", "Significant"))
+
+# Save figure
+# ggsave("Figures/volcano_plot_high_grade_cav_FDR.png", dpi = 1200, bg = "white")
+
+# How many unique subclusters in this DE analysis?
+length(unique(de_stat_high_grade$subcluster))
+
+# Create custom colors for each subcluster
+custom_colors <- c(
+  "#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00",
+  "#FFD700", "#A65628", "#F781BF", "#999999", "#66C2A5",
+  "#FC8D62", "#8DA0CB", "#E78AC3", "#A6D854", "#FFD92F"
+)
+
+# Cell-specific volcano plot
+ggplot(de_stat_high_grade, aes(x = logFC, y = -log10(pval), color = subcluster)) +
+  geom_point() +
+  scale_color_manual(values = custom_colors) +
+  ggrepel::geom_text_repel(data = head((de_stat_high_grade %>% arrange(pval_corrected_across_genes)), 20), aes(label = gene)) +
+  cowplot::theme_cowplot()
+
+# Save figure
+# ggsave("Figures/volcano_high_grade_cell_specific.png", dpi = 1200, bg = "white")
+```
+
+CAV:
+```{r}
+# Joining subcluster info to nhoods
+de_stat_group <- inner_join(de_stat_group, nhood_stat_ct, by = c("Nhood", "Nhood_center"))
+
+# Volcano plot
+ggplot(de_stat_group, aes(x = logFC, y = -log10(pval), color = (pval_corrected_across_genes < 0.05 & pval_corrected_across_nhoods < 0.05))) +
+  geom_point() +
+  ggrepel::geom_text_repel(data = head((de_stat_group %>% arrange(pval_corrected_across_genes)), 20), aes(label = gene)) +
+  cowplot::theme_cowplot()  +
+  scale_color_manual(name = "FDR < 0.05", 
+                     values = c("TRUE" = "red", "FALSE" = "black"),
+                     labels = c("Not significant", "Significant"))
+
+# Save figure
+# ggsave("Figures/volcano_plot_all_cav_FDR.png", dpi = 1200, bg = "white")
+
+# How many unique subclusters in this DE analysis?
+length(unique(de_stat_group$subcluster))
+
+# Create custom colors
+custom_colors_cav <- c(
+  "#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00",
+  "#FFD700", "#A65628", "#F781BF", "#999999", "#66C2A5",
+  "#FC8D62", "#8DA0CB", "#E78AC3", "#A6D854", "#FFD92F",
+  "#E5C494"
+)
+
+# Cell-specific volcano plot
+ggplot(de_stat_group, aes(x = logFC, y = -log10(pval), color = subcluster)) +
+  geom_point() +
+  scale_color_manual(values = custom_colors_cav) +
+  ggrepel::geom_text_repel(data = head((de_stat_group %>% arrange(pval_corrected_across_genes)), 20), aes(label = gene)) +
+  cowplot::theme_cowplot()
+
+# Save figure
+# ggsave("Figures/volcano_all_cav_cell_specific.png", dpi = 1200, bg = "white")
+```
+
+Prednisone:
+```{r}
+# Joining subcluster info to nhoods
+de_stat_pred <- inner_join(de_stat_pred, nhood_stat_ct, by = c("Nhood", "Nhood_center"))
+
+# Volcano plot
+ggplot(de_stat_pred, aes(x = logFC, y = -log10(pval), color = (pval_corrected_across_genes < 0.05 & pval_corrected_across_nhoods < 0.05))) +
+  geom_point() +
+  ggrepel::geom_text_repel(data = head((de_stat_pred %>% arrange(pval_corrected_across_genes)), 20), aes(label = gene)) +
+  theme_bw()  +
+  scale_color_manual(name = "FDR < 0.05", 
+                     values = c("TRUE" = "red", "FALSE" = "black"),
+                     labels = c("Not significant", "Significant"))
+
+# Save figure
+# ggsave("Figures/volcano_plot_prednisone_FDR.png", dpi = 1200, bg = "white")
+
+# How many unique subclusters?
+length(unique(de_stat_pred$subcluster))
+
+# Create custom colors
+custom_colors_pred <- c(
+  "#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00",
+  "#FFD700", "#A65628", "#F781BF", "#999999", "#66C2A5",
+  "#FC8D62", "#8DA0CB", "#E78AC3", "#A6D854", "#FFD92F"
+)
+
+# Cell-specific volcano plot
+ggplot(de_stat_pred, aes(x = logFC, y = -log10(pval), color = subcluster)) +
+  geom_point() +
+  scale_color_manual(values = custom_colors_pred) +
+  ggrepel::geom_text_repel(data = head((de_stat_pred %>% arrange(pval_corrected_across_genes)), 20), aes(label = gene)) +
+  cowplot::theme_cowplot()
+
+# Save figure
+# ggsave("Figures/volcano_plot_prednisone_cell_specific.png", dpi = 1200, bg = "white")
+```
+
+
+## Testing modules
+
+Next, we want to evaluate whether these significant genes fall into specific modules that are enriched for expected biological pathways in CAV. We will perform WGCNA for pval < 0.1 (to be exploratory). Instead of gene counts we will use corrected logFC (logFC set to 0 in the neighborhoods in which it is not DE).
+```{r}
+de_stat <- de_stat_high_grade
+de_stat <- as.data.frame(de_stat)
+
+get_wgcna_modules = function(de_stat, subset_hoods = NULL , 
+                             n_hoods_sig.thresh = 2 ,
+                             npcs = 5 ,
+                             pval.thresh = 0.1 ){
+  require(scWGCNA)
+  require(Seurat)
+  require(dplyr)
+  require(reshape2)
+  
+  set.seed(32)
+  # subset hoods
+  if (!is.null(subset_hoods)){
+    de_stat = de_stat[de_stat$Nhood %in% subset_hoods , ]
+  }
+  
+  # focus on genes that DE in at least 2 nhoods
+  de_stat_per_gene = de_stat %>% dplyr::group_by(gene) %>% dplyr::summarise(n_hoods_sig = sum(pval_corrected_across_nhoods < pval.thresh , na.rm = TRUE))
+  genes_sig = de_stat_per_gene$gene[de_stat_per_gene$n_hoods_sig >= n_hoods_sig.thresh]
+  
+  de_stat = de_stat[de_stat$gene %in% genes_sig, ]
+  de_stat = de_stat[order(de_stat$Nhood) , ]
+  
+  # discard neighbourhoods in which testing was not performed
+  de_stat = de_stat[de_stat$test_performed , ]
+  
+  # for this analysis, set logFC to 0 and pvals to 1 if they are NaN
+  de_stat$logFC[is.na(de_stat$logFC)] = 0
+  de_stat$pval[is.na(de_stat$pval)] = 1
+  de_stat$pval_corrected_across_genes[is.na(de_stat$pval_corrected_across_genes)] = 1
+  de_stat$pval_corrected_across_nhoods[is.na(de_stat$pval_corrected_across_nhoods)] = 1
+  
+  # set logFC to 0 if pval_corrected_across_nhoods > pval.thresh
+  de_stat$logFC[de_stat$pval_corrected_across_nhoods >= pval.thresh] = 0
+  
+  # move the object to Seurat
+  de_stat = reshape2::dcast(data = de_stat, formula = gene~Nhood, value.var = "logFC")
+  rownames(de_stat) = de_stat$gene
+  de_stat = de_stat[,2:ncol(de_stat)]
+  
+  obj.seurat <- CreateSeuratObject(counts = de_stat)
+  DefaultAssay(obj.seurat) <- "RNA"
+  obj.seurat = FindVariableFeatures(obj.seurat)
+  # scale
+  obj.seurat[["RNA"]]@scale.data = as.matrix(obj.seurat[["RNA"]]@data)
+  obj.seurat = RunPCA(obj.seurat , npcs = npcs)
+  
+  # run scwgcna
+  clusters_scwgcna = run.scWGCNA(p.cells = obj.seurat, 
+                                 s.cells = obj.seurat, 
+                                 is.pseudocell = F, 
+                                 features = rownames(obj.seurat),
+                                 less = TRUE , merging = TRUE)
+  # compile stat
+  clusters = lapply(1:length(clusters_scwgcna$module.genes) , function(i){
+    out = data.frame(cluster = i , gene = clusters_scwgcna$module.genes[[i]] , n_genes = length(clusters_scwgcna$module.genes[[i]]))
+    return(out)
+  })
+  clusters = do.call(rbind , clusters)
+  # add colors
+  genes_w_colors = clusters_scwgcna$dynamicCols
+  genes_w_colors = data.frame(gene = names(genes_w_colors) , cluster_color = genes_w_colors)
+  clusters = merge(clusters , genes_w_colors)
+  
+  return(clusters)
+}
+
+
+# For simplicity we will focus on genes that are DE in at least 4 neighborhoods
+modules_wgcna = suppressMessages(get_wgcna_modules(de_stat , n_hoods_sig.thresh = 4))
+
+# Save csv file
+# write_csv(modules_wgcna, "Figures/high_grade_modules_wgcna.csv")
+```
+
+## Pathway enrichment
+
+First, I will do pseudobulk enrichment using all genes that were significantly DE in high-grade CAV vs all. Then, I will break it down by module. The entire list of genes tested (~17,000) will be used as background.
+
+```{r}
+# High-grade CAV - PSEUDOBULK
+gene_high_grade <- de_stat_high_grade %>% filter(pval_corrected_across_genes < 0.05) %>% pull(gene)
+gene_high_grade <- unique(gene_high_grade)
+
+# Set background universe
+background_high_grade <- de_stat_high_grade %>% pull(gene) %>% unique()
+
+ego_high_grade <- enrichGO(
+  gene = gene_high_grade,
+  universe = background_high_grade,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.01,
+  qvalueCutoff  = 0.05
+)
+
+# Visualize
+dotplot(ego_high_grade, showCategory=20)
+
+# Save figure
+# ggsave("Figures/Enrichment_pseudobulk_high_grade_cav.png", dpi = 1200, bg = "white")
+
+# Modules
+module_1 <- modules_wgcna %>% filter(cluster == 1) %>% pull(gene)
+ego_mod_1 <- enrichGO(
+  gene = module_1,
+  universe = background_high_grade,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.01,
+  qvalueCutoff  = 0.05
+)
+
+module_2 <- modules_wgcna %>% filter(cluster == 2) %>% pull(gene)
+ego_mod_2 <- enrichGO(
+  gene = module_2,
+  universe = background_high_grade,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.01,
+  qvalueCutoff  = 0.05
+)
+
+module_3 <- modules_wgcna %>% filter(cluster == 3) %>% pull(gene)
+ego_mod_3 <- enrichGO(
+  gene = module_3,
+  universe = background_high_grade,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.01,
+  qvalueCutoff  = 0.05
+)
+
+module_4 <- modules_wgcna %>% filter(cluster == 4) %>% pull(gene)
+ego_mod_4 <- enrichGO(
+  gene = module_4,
+  universe = background_high_grade,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.01,
+  qvalueCutoff  = 0.05
+)
+head(ego_mod_4)
+dotplot(ego_mod_4, showCategory=20)
+
+# Save figure
+# ggsave("Figures/Enrichment_Module_4_high_grade.png", dpi = 1200, bg = "white")
+
+module_5 <- modules_wgcna %>% filter(cluster == 5) %>% pull(gene)
+ego_mod_5 <- enrichGO(
+  gene = module_5,
+  universe = background_high_grade,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.01,
+  qvalueCutoff  = 0.05
+)
+head(ego_mod_5)
+dotplot(ego_mod_5, showCategory=20)
+
+# Save figure
+ggsave("Figures/Enrichment_Module_5_high_grade.png", dpi = 1200, bg = "white")
+
+module_6 <- modules_wgcna %>% filter(cluster == 6) %>% pull(gene)
+ego_mod_6 <- enrichGO(
+  gene = module_6,
+  universe = background_high_grade,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.01,
+  qvalueCutoff  = 0.05
+)
+head(ego_mod_6)
+
+module_7 <- modules_wgcna %>% filter(cluster == 7) %>% pull(gene)
+ego_mod_7 <- enrichGO(
+  gene = module_7,
+  universe = background_high_grade,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.01,
+  qvalueCutoff  = 0.05
+)
+head(ego_mod_7)
+dotplot(ego_mod_7, showCategory=30)
+
+# Save figure
+ggsave("Figures/Enrichment_Module_7_high_grade.png", dpi = 1200, bg = "white", height = 15)
+
+module_8 <- modules_wgcna %>% filter(cluster == 8) %>% pull(gene)
+ego_mod_8 <- enrichGO(
+  gene = module_8,
+  universe = background_high_grade,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.01,
+  qvalueCutoff  = 0.05
+)
+head(ego_mod_8)
+dotplot(ego_mod_8, showCategory=30)
+
+# Save figure
+# ggsave("Figures/Enrichment_Module_8_high_grade.png", dpi = 1200, bg = "white")
+```
+## Secondary analyses
+
+I will now repeat what I've done above to the prednisone group and the CAV vs non-CAV group. These will be supplemental figures.
+
+PREDNISONE:
+```{r}
+de_stat <- de_stat_pred
+de_stat <- as.data.frame(de_stat)
+
+get_wgcna_modules = function(de_stat, subset_hoods = NULL , 
+                             n_hoods_sig.thresh = 2 ,
+                             npcs = 5 ,
+                             pval.thresh = 0.1 ){
+  require(scWGCNA)
+  require(Seurat)
+  require(dplyr)
+  require(reshape2)
+  
+  set.seed(32)
+  # subset hoods
+  if (!is.null(subset_hoods)){
+    de_stat = de_stat[de_stat$Nhood %in% subset_hoods , ]
+  }
+  
+  # focus on genes that DE in at least 2 nhoods
+  de_stat_per_gene = de_stat %>% dplyr::group_by(gene) %>% dplyr::summarise(n_hoods_sig = sum(pval_corrected_across_nhoods < pval.thresh , na.rm = TRUE))
+  genes_sig = de_stat_per_gene$gene[de_stat_per_gene$n_hoods_sig >= n_hoods_sig.thresh]
+  
+  de_stat = de_stat[de_stat$gene %in% genes_sig, ]
+  de_stat = de_stat[order(de_stat$Nhood) , ]
+  
+  # discard neighbourhoods in which testing was not performed
+  de_stat = de_stat[de_stat$test_performed , ]
+  
+  # for this analysis, set logFC to 0 and pvals to 1 if they are NaN
+  de_stat$logFC[is.na(de_stat$logFC)] = 0
+  de_stat$pval[is.na(de_stat$pval)] = 1
+  de_stat$pval_corrected_across_genes[is.na(de_stat$pval_corrected_across_genes)] = 1
+  de_stat$pval_corrected_across_nhoods[is.na(de_stat$pval_corrected_across_nhoods)] = 1
+  
+  # set logFC to 0 if pval_corrected_across_nhoods > pval.thresh
+  de_stat$logFC[de_stat$pval_corrected_across_nhoods >= pval.thresh] = 0
+  
+  # move the object to Seurat
+  de_stat = reshape2::dcast(data = de_stat, formula = gene~Nhood, value.var = "logFC")
+  rownames(de_stat) = de_stat$gene
+  de_stat = de_stat[,2:ncol(de_stat)]
+  
+  obj.seurat <- CreateSeuratObject(counts = de_stat)
+  DefaultAssay(obj.seurat) <- "RNA"
+  obj.seurat = FindVariableFeatures(obj.seurat)
+  # scale
+  obj.seurat[["RNA"]]@scale.data = as.matrix(obj.seurat[["RNA"]]@data)
+  obj.seurat = RunPCA(obj.seurat , npcs = npcs)
+  
+  # run scwgcna
+  clusters_scwgcna = run.scWGCNA(p.cells = obj.seurat, 
+                                 s.cells = obj.seurat, 
+                                 is.pseudocell = F, 
+                                 features = rownames(obj.seurat),
+                                 less = TRUE , merging = TRUE)
+  # compile stat
+  clusters = lapply(1:length(clusters_scwgcna$module.genes) , function(i){
+    out = data.frame(cluster = i , gene = clusters_scwgcna$module.genes[[i]] , n_genes = length(clusters_scwgcna$module.genes[[i]]))
+    return(out)
+  })
+  clusters = do.call(rbind , clusters)
+  # add colors
+  genes_w_colors = clusters_scwgcna$dynamicCols
+  genes_w_colors = data.frame(gene = names(genes_w_colors) , cluster_color = genes_w_colors)
+  clusters = merge(clusters , genes_w_colors)
+  
+  return(clusters)
+}
+
+
+# For simplicity we will focus on genes that are DE in at least 2 neighborhoods
+modules_wgcna = suppressMessages(get_wgcna_modules(de_stat , n_hoods_sig.thresh = 2))
+
+# Save csv file
+# write_csv(modules_wgcna, "Figures/pred_modules_wgcna.csv")
+
+# Pathway enrichment
+# Prednisone vs others - PSEUDOBULK
+gene_pred <- de_stat_pred %>% filter(pval_corrected_across_genes < 0.05) %>% pull(gene)
+gene_pred <- unique(gene_pred)
+
+# Set background universe
+background_pred <- de_stat_pred %>% pull(gene) %>% unique()
+
+ego_pred <- enrichGO(
+  gene = gene_pred,
+  universe = background_pred,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.01,
+  qvalueCutoff  = 0.05
+)
+
+# Visualize
+dotplot(ego_pred, showCategory=30)
+
+# Save figure
+ggsave("Figures/Enrichment_pseudobulk_prednisone.png", dpi = 1200, bg = "white", height = 15)
+
+# Modules
+pred_1 <- modules_wgcna %>% filter(cluster == 1) %>% pull(gene)
+pred_mod_1 <- enrichGO(
+  gene = pred_1,
+  universe = background_pred,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.01,
+  qvalueCutoff  = 0.05
+)
+head(pred_mod_1)
+
+pred_2 <- modules_wgcna %>% filter(cluster == 2) %>% pull(gene)
+pred_mod_2 <- enrichGO(
+  gene = pred_2,
+  universe = background_pred,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.01,
+  qvalueCutoff  = 0.05
+)
+head(pred_mod_2)
+```
+
+While the "pseudobulk" results showed enrichment for pathways that are typically associated with glucocorticoids, neither of the two modules showed biological pathway enrichment.
+
+CAV:
+```{r}
+de_stat <- de_stat_group
+de_stat <- as.data.frame(de_stat)
+
+get_wgcna_modules = function(de_stat, subset_hoods = NULL , 
+                             n_hoods_sig.thresh = 2 ,
+                             npcs = 5 ,
+                             pval.thresh = 0.1 ){
+  require(scWGCNA)
+  require(Seurat)
+  require(dplyr)
+  require(reshape2)
+  
+  set.seed(32)
+  # subset hoods
+  if (!is.null(subset_hoods)){
+    de_stat = de_stat[de_stat$Nhood %in% subset_hoods , ]
+  }
+  
+  # focus on genes that DE in at least 2 nhoods
+  de_stat_per_gene = de_stat %>% dplyr::group_by(gene) %>% dplyr::summarise(n_hoods_sig = sum(pval_corrected_across_nhoods < pval.thresh , na.rm = TRUE))
+  genes_sig = de_stat_per_gene$gene[de_stat_per_gene$n_hoods_sig >= n_hoods_sig.thresh]
+  
+  de_stat = de_stat[de_stat$gene %in% genes_sig, ]
+  de_stat = de_stat[order(de_stat$Nhood) , ]
+  
+  # discard neighbourhoods in which testing was not performed
+  de_stat = de_stat[de_stat$test_performed , ]
+  
+  # for this analysis, set logFC to 0 and pvals to 1 if they are NaN
+  de_stat$logFC[is.na(de_stat$logFC)] = 0
+  de_stat$pval[is.na(de_stat$pval)] = 1
+  de_stat$pval_corrected_across_genes[is.na(de_stat$pval_corrected_across_genes)] = 1
+  de_stat$pval_corrected_across_nhoods[is.na(de_stat$pval_corrected_across_nhoods)] = 1
+  
+  # set logFC to 0 if pval_corrected_across_nhoods > pval.thresh
+  de_stat$logFC[de_stat$pval_corrected_across_nhoods >= pval.thresh] = 0
+  
+  # move the object to Seurat
+  de_stat = reshape2::dcast(data = de_stat, formula = gene~Nhood, value.var = "logFC")
+  rownames(de_stat) = de_stat$gene
+  de_stat = de_stat[,2:ncol(de_stat)]
+  
+  obj.seurat <- CreateSeuratObject(counts = de_stat)
+  DefaultAssay(obj.seurat) <- "RNA"
+  obj.seurat = FindVariableFeatures(obj.seurat)
+  # scale
+  obj.seurat[["RNA"]]@scale.data = as.matrix(obj.seurat[["RNA"]]@data)
+  obj.seurat = RunPCA(obj.seurat , npcs = npcs)
+  
+  # run scwgcna
+  clusters_scwgcna = run.scWGCNA(p.cells = obj.seurat, 
+                                 s.cells = obj.seurat, 
+                                 is.pseudocell = F, 
+                                 features = rownames(obj.seurat),
+                                 less = TRUE , merging = TRUE)
+  # compile stat
+  clusters = lapply(1:length(clusters_scwgcna$module.genes) , function(i){
+    out = data.frame(cluster = i , gene = clusters_scwgcna$module.genes[[i]] , n_genes = length(clusters_scwgcna$module.genes[[i]]))
+    return(out)
+  })
+  clusters = do.call(rbind , clusters)
+  # add colors
+  genes_w_colors = clusters_scwgcna$dynamicCols
+  genes_w_colors = data.frame(gene = names(genes_w_colors) , cluster_color = genes_w_colors)
+  clusters = merge(clusters , genes_w_colors)
+  
+  return(clusters)
+}
+
+
+# For simplicity we will focus on genes that are DE in at least 2 neighborhoods
+modules_wgcna = suppressMessages(get_wgcna_modules(de_stat , n_hoods_sig.thresh = 2))
+
+# Save csv file
+# write_csv(modules_wgcna, "Figures/CAV_modules_wgcna.csv")
+
+# Pathway enrichment
+# CAV vs non-CAV - PSEUDOBULK
+gene_cav <- de_stat_group %>% filter(pval_corrected_across_genes < 0.05) %>% pull(gene)
+gene_cav <- unique(gene_cav)
+
+# Set background universe
+background_cav <- de_stat_group %>% pull(gene) %>% unique()
+
+ego_cav <- enrichGO(
+  gene = gene_cav,
+  universe = background_cav,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.01,
+  qvalueCutoff  = 0.05
+)
+
+# Visualize
+dotplot(ego_cav, showCategory=30)
+
+# Save figure
+# ggsave("Figures/Enrichment_pseudobulk_CAV.png", dpi = 1200, bg = "white", height = 12)
+
+# Modules
+cav_1 <- modules_wgcna %>% filter(cluster == 1) %>% pull(gene)
+cav_mod_1 <- enrichGO(
+  gene = cav_1,
+  universe = background_cav,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.01,
+  qvalueCutoff  = 0.05
+)
+head(cav_mod_1)
+
+dotplot(cav_mod_1, showCategory=30)
+
+# Save figure
+# ggsave("Figures/Enrichment_Module_1_CAV.png", dpi = 1200, bg = "white")
+
+cav_2 <- modules_wgcna %>% filter(cluster == 2) %>% pull(gene)
+cav_mod_2 <- enrichGO(
+  gene = cav_2,
+  universe = background_cav,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.01,
+  qvalueCutoff  = 0.05
+)
+head(cav_mod_2)
+
+cav_3 <- modules_wgcna %>% filter(cluster == 3) %>% pull(gene)
+cav_mod_3 <- enrichGO(
+  gene = cav_3,
+  universe = background_cav,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.01,
+  qvalueCutoff  = 0.05
+)
+head(cav_mod_3)
+
+cav_4 <- modules_wgcna %>% filter(cluster == 4) %>% pull(gene)
+cav_mod_4 <- enrichGO(
+  gene = cav_4,
+  universe = background_cav,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.01,
+  qvalueCutoff  = 0.05
+)
+head(cav_mod_4)
+
+cav_5 <- modules_wgcna %>% filter(cluster == 5) %>% pull(gene)
+cav_mod_5 <- enrichGO(
+  gene = cav_5,
+  universe = background_cav,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.01,
+  qvalueCutoff  = 0.05
+)
+head(cav_mod_5)
+
+dotplot(cav_mod_5, showCategory=30)
+
+# Save figure
+# ggsave("Figures/Enrichment_Module_5_CAV.png", dpi = 1200, bg = "white")
+```

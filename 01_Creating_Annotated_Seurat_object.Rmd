@@ -1,0 +1,1178 @@
+---
+title: "Creating Seurat object for PBMC CAV"
+author: "Kaushik Amancherla"
+date: "2024-02-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Load packages
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+library(DropletUtils)
+library(glmGamPoi)
+library(sctransform)
+library(harmony)
+library(SeuratDisk)
+library(SeuratData)
+library(celda)
+library(scDblFinder)
+library(Matrix)
+library(Nebulosa)
+library(RColorBrewer)
+library(scCustomize)
+
+# Set working directory
+setwd("C:/Users/amanchk/Downloads/PBMC_CAV_2.2024")
+```
+
+## Importing raw data to create seurat objects
+This is a single-cell RNA-seq study involving 40 patients (~half with CAV and the remaining without CAV). This was performed in collaboration with Jeff Rathmell, who provided funding support. Importantly, 5 patients were multiplexed into each sample using Total Seq C antibodies. A total of 8 samples were run.
+
+These were processed on CellRanger 6.1.2 and included the "include_introns" flag.
+
+I will import each of 8 samples one-by-one because the HTO (or hashtag oligos, a.k.a. the antibodies referring to each patient) are different in each group.
+
+The workflow will be as follows:
+1. Load raw and filtered counts files (.h5) from CellRanger output.
+2. Correct for ambient RNA using DecontX.
+3. Interrogate QC metrics and save those figures.
+4. Add column of barcodes (the same as rownames) for downstream integration with TCR/BCR analyses, etc.
+5. Filter down to high-quality cells only.
+
+Once all samples are QC'd and assembled, they will undergo doublet removal, batch correction, and integration.
+
+Sample 1:
+```{r}
+counts <- Read10X_h5("8256-SB-1/filtered_feature_bc_matrix.h5")
+tools::md5sum("8256-SB-1/filtered_feature_bc_matrix.h5")
+
+counts.raw <- Read10X_h5("8256-SB-1/raw_feature_bc_matrix.h5")
+tools::md5sum("8256-SB-1/raw_feature_bc_matrix.h5")
+
+# Correcting for ambient RNA using DecontX
+sce <- SingleCellExperiment(list(counts = counts$`Gene Expression`))
+sce.raw <- SingleCellExperiment(list(counts = counts.raw$`Gene Expression`))
+
+sce <- decontX(sce, background = sce.raw)
+
+# Merging with HTOs to create Seurat object
+pbmc.hashtag <- CreateSeuratObject(counts = round(decontXcounts(sce)), min.cells = 3, min.features = 100)
+pbmc.hashtag[["percent.mt"]] <- PercentageFeatureSet(pbmc.hashtag, pattern = "^MT-")
+
+VlnPlot(pbmc.hashtag, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+ggsave("QC/Sample_1_Raw_VlnPlt.png", dpi = 600)
+
+plot1 <- FeatureScatter(pbmc.hashtag, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(pbmc.hashtag, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+ggsave("QC/Sample_1_nFeatures_nCount.png", dpi = 300, height = 7, width = 17)
+
+pbmc.hashtag[["HTO"]] <- CreateAssayObject(counts = counts.raw$`Antibody Capture`[,colnames(pbmc.hashtag)])
+pbmc.hashtag <- NormalizeData(pbmc.hashtag, assay = "HTO", normalization.method = "CLR")
+
+pbmc.hashtag <- HTODemux(pbmc.hashtag, assay = "HTO", positive.quantile = 0.99)
+
+# Number of singlets and multiplets
+table(pbmc.hashtag$HTO_classification.global)
+
+Idents(pbmc.hashtag) <- "HTO_maxID"
+RidgePlot(pbmc.hashtag, assay = "HTO", features = rownames(pbmc.hashtag[["HTO"]]), ncol = 3)
+ggsave("QC/Sample_1_HTO_ridgeplot.png", dpi = 300)
+
+# Filter out the multiplets
+Idents(pbmc.hashtag) <- "HTO_classification.global"
+pbmc.singlet <- subset(pbmc.hashtag, idents = "Singlet")
+
+VlnPlot(pbmc.singlet, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+ggsave("QC/Sample_1_Singlet_VlnPlt.png", dpi = 300)
+
+# Filter out poor quality cells using UMI, mtRNA, etc., metrics
+x <- (quantile(pbmc.singlet$nFeature_RNA, 0.75) + 1.5*IQR(pbmc.singlet$nFeature_RNA))
+y <- (quantile(pbmc.singlet$nCount_RNA, 0.75) + 1.5*IQR(pbmc.singlet$nCount_RNA))
+
+# Selected 10% mtRNA cut-off based on literature review ranging from ~5-15% for PBMCs
+pbmc.singlet <- subset(pbmc.singlet,
+                       subset = nFeature_RNA > 100 & nFeature_RNA < x & nCount_RNA < y & percent.mt < 10)
+
+# Confirm that HTO classification is the same as the hash ID
+all(pbmc.singlet@meta.data$HTO_classification == pbmc.singlet@meta.data$hash.ID)
+
+# Add a barcode column (copied from rownames)
+pbmc.singlet@meta.data <- pbmc.singlet@meta.data %>% rownames_to_column(var = "barcodes") %>%
+  mutate(barcode = barcodes) %>%
+  column_to_rownames(var = "barcodes")
+
+# Add sample ID information based on HTO antibodies
+pbmc.singlet@meta.data <- pbmc.singlet@meta.data %>%
+  dplyr::mutate(
+    Sample_ID = case_when(
+      HTO_classification == "C0251" ~ "CVD_001",
+      HTO_classification == "C0252" ~ "CVD_002",
+      HTO_classification == "C0253" ~ "CVD_003",
+      HTO_classification == "C0254" ~ "CVD_004",
+      HTO_classification == "C0255" ~ "CVD_005"
+    ))
+
+saveRDS(pbmc.singlet, "Processing_RDS_files/2024_decontX_sample_1.rds")
+
+# Clear the global environment to preserve memory
+rm(list=ls())
+gc()
+```
+Sample 2:
+```{r}
+counts <- Read10X_h5("8256-SB-2/filtered_feature_bc_matrix.h5")
+tools::md5sum("8256-SB-2/filtered_feature_bc_matrix.h5")
+
+counts.raw <- Read10X_h5("8256-SB-2/raw_feature_bc_matrix.h5")
+tools::md5sum("8256-SB-2/raw_feature_bc_matrix.h5")
+
+# Correcting for ambient RNA using DecontX
+sce <- SingleCellExperiment(list(counts = counts$`Gene Expression`))
+sce.raw <- SingleCellExperiment(list(counts = counts.raw$`Gene Expression`))
+
+sce <- decontX(sce, background = sce.raw)
+
+# Merging with HTOs to create Seurat object
+pbmc.hashtag <- CreateSeuratObject(counts = round(decontXcounts(sce)), min.cells = 3, min.features = 100)
+pbmc.hashtag[["percent.mt"]] <- PercentageFeatureSet(pbmc.hashtag, pattern = "^MT-")
+
+VlnPlot(pbmc.hashtag, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+ggsave("QC/Sample_2_Raw_VlnPlt.png", dpi = 600)
+
+plot1 <- FeatureScatter(pbmc.hashtag, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(pbmc.hashtag, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+ggsave("QC/Sample_2_nFeatures_nCount.png", dpi = 300, height = 7, width = 17)
+
+pbmc.hashtag[["HTO"]] <- CreateAssayObject(counts = counts.raw$`Antibody Capture`[,colnames(pbmc.hashtag)])
+pbmc.hashtag <- NormalizeData(pbmc.hashtag, assay = "HTO", normalization.method = "CLR")
+
+pbmc.hashtag <- HTODemux(pbmc.hashtag, assay = "HTO", positive.quantile = 0.99)
+
+# Number of singlets and multiplets
+table(pbmc.hashtag$HTO_classification.global)
+
+Idents(pbmc.hashtag) <- "HTO_maxID"
+RidgePlot(pbmc.hashtag, assay = "HTO", features = rownames(pbmc.hashtag[["HTO"]]), ncol = 3)
+ggsave("QC/Sample_2_HTO_ridgeplot.png", dpi = 300)
+
+# Filter out the multiplets
+Idents(pbmc.hashtag) <- "HTO_classification.global"
+pbmc.singlet <- subset(pbmc.hashtag, idents = "Singlet")
+
+VlnPlot(pbmc.singlet, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+ggsave("QC/Sample_2_Singlet_VlnPlt.png", dpi = 300)
+
+# Filter out poor quality cells using UMI, mtRNA, etc., metrics
+x <- (quantile(pbmc.singlet$nFeature_RNA, 0.75) + 1.5*IQR(pbmc.singlet$nFeature_RNA))
+y <- (quantile(pbmc.singlet$nCount_RNA, 0.75) + 1.5*IQR(pbmc.singlet$nCount_RNA))
+
+# Selected 10% mtRNA cut-off based on literature review ranging from ~5-15% for PBMCs
+pbmc.singlet <- subset(pbmc.singlet,
+                       subset = nFeature_RNA > 100 & nFeature_RNA < x & nCount_RNA < y & percent.mt < 10)
+
+# Confirm that HTO classification is the same as the hash ID
+all(pbmc.singlet@meta.data$HTO_classification == pbmc.singlet@meta.data$hash.ID)
+
+# Add a barcode column (copied from rownames)
+pbmc.singlet@meta.data <- pbmc.singlet@meta.data %>% rownames_to_column(var = "barcodes") %>%
+  mutate(barcode = barcodes) %>%
+  column_to_rownames(var = "barcodes")
+
+# Add sample ID information based on HTO antibodies
+pbmc.singlet@meta.data <- pbmc.singlet@meta.data %>%
+  dplyr::mutate(
+    Sample_ID = case_when(
+      HTO_classification == "C0251" ~ "CVD_006",
+      HTO_classification == "C0252" ~ "CVD_007",
+      HTO_classification == "C0253" ~ "CVD_008",
+      HTO_classification == "C0254" ~ "CVD_009",
+      HTO_classification == "C0255" ~ "CVD_010"
+    ))
+
+saveRDS(pbmc.singlet, "Processing_RDS_files/2024_decontX_sample_2.rds")
+
+# Clear the global environment to preserve memory
+rm(list=ls())
+gc()
+```
+Sample 3:
+```{r}
+counts <- Read10X_h5("8256-SB-3/filtered_feature_bc_matrix.h5")
+tools::md5sum("8256-SB-3/filtered_feature_bc_matrix.h5")
+
+counts.raw <- Read10X_h5("8256-SB-3/raw_feature_bc_matrix.h5")
+tools::md5sum("8256-SB-3/raw_feature_bc_matrix.h5")
+
+# Correcting for ambient RNA using DecontX
+sce <- SingleCellExperiment(list(counts = counts$`Gene Expression`))
+sce.raw <- SingleCellExperiment(list(counts = counts.raw$`Gene Expression`))
+
+sce <- decontX(sce, background = sce.raw)
+
+# Merging with HTOs to create Seurat object
+pbmc.hashtag <- CreateSeuratObject(counts = round(decontXcounts(sce)), min.cells = 3, min.features = 100)
+pbmc.hashtag[["percent.mt"]] <- PercentageFeatureSet(pbmc.hashtag, pattern = "^MT-")
+
+VlnPlot(pbmc.hashtag, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+ggsave("QC/Sample_3_Raw_VlnPlt.png", dpi = 600)
+
+plot1 <- FeatureScatter(pbmc.hashtag, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(pbmc.hashtag, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+ggsave("QC/Sample_3_nFeatures_nCount.png", dpi = 300, height = 7, width = 17)
+
+pbmc.hashtag[["HTO"]] <- CreateAssayObject(counts = counts.raw$`Antibody Capture`[,colnames(pbmc.hashtag)])
+pbmc.hashtag <- NormalizeData(pbmc.hashtag, assay = "HTO", normalization.method = "CLR")
+
+pbmc.hashtag <- HTODemux(pbmc.hashtag, assay = "HTO", positive.quantile = 0.99)
+
+# Number of singlets and multiplets
+table(pbmc.hashtag$HTO_classification.global)
+
+Idents(pbmc.hashtag) <- "HTO_maxID"
+RidgePlot(pbmc.hashtag, assay = "HTO", features = rownames(pbmc.hashtag[["HTO"]]), ncol = 3)
+ggsave("QC/Sample_3_HTO_ridgeplot.png", dpi = 300)
+
+# Filter out the multiplets
+Idents(pbmc.hashtag) <- "HTO_classification.global"
+pbmc.singlet <- subset(pbmc.hashtag, idents = "Singlet")
+
+VlnPlot(pbmc.singlet, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+ggsave("QC/Sample_3_Singlet_VlnPlt.png", dpi = 300)
+
+# Filter out poor quality cells using UMI, mtRNA, etc., metrics
+x <- (quantile(pbmc.singlet$nFeature_RNA, 0.75) + 1.5*IQR(pbmc.singlet$nFeature_RNA))
+y <- (quantile(pbmc.singlet$nCount_RNA, 0.75) + 1.5*IQR(pbmc.singlet$nCount_RNA))
+
+# Selected 10% mtRNA cut-off based on literature review ranging from ~5-15% for PBMCs
+pbmc.singlet <- subset(pbmc.singlet,
+                       subset = nFeature_RNA > 100 & nFeature_RNA < x & nCount_RNA < y & percent.mt < 10)
+
+# Confirm that HTO classification is the same as the hash ID
+all(pbmc.singlet@meta.data$HTO_classification == pbmc.singlet@meta.data$hash.ID)
+
+# Add a barcode column (copied from rownames)
+pbmc.singlet@meta.data <- pbmc.singlet@meta.data %>% rownames_to_column(var = "barcodes") %>%
+  mutate(barcode = barcodes) %>%
+  column_to_rownames(var = "barcodes")
+
+# Add sample ID information based on HTO antibodies
+pbmc.singlet@meta.data <- pbmc.singlet@meta.data %>%
+  dplyr::mutate(
+    Sample_ID = case_when(
+      HTO_classification == "C0251" ~ "CVD_033",
+      HTO_classification == "C0252" ~ "CVD_034",
+      HTO_classification == "C0253" ~ "CVD_035",
+      HTO_classification == "C0254" ~ "CVD_036",
+      HTO_classification == "C0255" ~ "CVD_040"
+    ))
+
+saveRDS(pbmc.singlet, "Processing_RDS_files/2024_decontX_sample_3.rds")
+
+# Clear the global environment to preserve memory
+rm(list=ls())
+gc()
+```
+
+Sample 4:
+```{r}
+counts <- Read10X_h5("8256-SB-4/filtered_feature_bc_matrix.h5")
+tools::md5sum("8256-SB-4/filtered_feature_bc_matrix.h5")
+
+counts.raw <- Read10X_h5("8256-SB-4/raw_feature_bc_matrix.h5")
+tools::md5sum("8256-SB-4/raw_feature_bc_matrix.h5")
+
+# Correcting for ambient RNA using DecontX
+sce <- SingleCellExperiment(list(counts = counts$`Gene Expression`))
+sce.raw <- SingleCellExperiment(list(counts = counts.raw$`Gene Expression`))
+
+sce <- decontX(sce, background = sce.raw)
+
+# Merging with HTOs to create Seurat object
+pbmc.hashtag <- CreateSeuratObject(counts = round(decontXcounts(sce)), min.cells = 3, min.features = 100)
+pbmc.hashtag[["percent.mt"]] <- PercentageFeatureSet(pbmc.hashtag, pattern = "^MT-")
+
+VlnPlot(pbmc.hashtag, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+ggsave("QC/Sample_4_Raw_VlnPlt.png", dpi = 600)
+
+plot1 <- FeatureScatter(pbmc.hashtag, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(pbmc.hashtag, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+ggsave("QC/Sample_4_nFeatures_nCount.png", dpi = 300, height = 7, width = 17)
+
+pbmc.hashtag[["HTO"]] <- CreateAssayObject(counts = counts.raw$`Antibody Capture`[,colnames(pbmc.hashtag)])
+pbmc.hashtag <- NormalizeData(pbmc.hashtag, assay = "HTO", normalization.method = "CLR")
+
+pbmc.hashtag <- HTODemux(pbmc.hashtag, assay = "HTO", positive.quantile = 0.99)
+
+# Number of singlets and multiplets
+table(pbmc.hashtag$HTO_classification.global)
+
+Idents(pbmc.hashtag) <- "HTO_maxID"
+RidgePlot(pbmc.hashtag, assay = "HTO", features = rownames(pbmc.hashtag[["HTO"]]), ncol = 3)
+ggsave("QC/Sample_4_HTO_ridgeplot.png", dpi = 300)
+
+# Filter out the multiplets
+Idents(pbmc.hashtag) <- "HTO_classification.global"
+pbmc.singlet <- subset(pbmc.hashtag, idents = "Singlet")
+
+VlnPlot(pbmc.singlet, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+ggsave("QC/Sample_4_Singlet_VlnPlt.png", dpi = 300)
+
+# Filter out poor quality cells using UMI, mtRNA, etc., metrics
+x <- (quantile(pbmc.singlet$nFeature_RNA, 0.75) + 1.5*IQR(pbmc.singlet$nFeature_RNA))
+y <- (quantile(pbmc.singlet$nCount_RNA, 0.75) + 1.5*IQR(pbmc.singlet$nCount_RNA))
+
+# Selected 10% mtRNA cut-off based on literature review ranging from ~5-15% for PBMCs
+pbmc.singlet <- subset(pbmc.singlet,
+                       subset = nFeature_RNA > 100 & nFeature_RNA < x & nCount_RNA < y & percent.mt < 10)
+
+# Confirm that HTO classification is the same as the hash ID
+all(pbmc.singlet@meta.data$HTO_classification == pbmc.singlet@meta.data$hash.ID)
+
+# Add a barcode column (copied from rownames)
+pbmc.singlet@meta.data <- pbmc.singlet@meta.data %>% rownames_to_column(var = "barcodes") %>%
+  mutate(barcode = barcodes) %>%
+  column_to_rownames(var = "barcodes")
+
+# Add sample ID information based on HTO antibodies
+pbmc.singlet@meta.data <- pbmc.singlet@meta.data %>%
+  dplyr::mutate(
+    Sample_ID = case_when(
+      HTO_classification == "C0251" ~ "CVD_038",
+      HTO_classification == "C0252" ~ "CVD_039",
+      HTO_classification == "C0253" ~ "CVD_011",
+      HTO_classification == "C0254" ~ "CVD_012",
+      HTO_classification == "C0255" ~ "CVD_013"
+    ))
+
+saveRDS(pbmc.singlet, "Processing_RDS_files/2024_decontX_sample_4.rds")
+
+# Clear the global environment to preserve memory
+rm(list=ls())
+gc()
+```
+
+Sample 5:
+```{r}
+counts <- Read10X_h5("8256-SB-5/filtered_feature_bc_matrix.h5")
+tools::md5sum("8256-SB-5/filtered_feature_bc_matrix.h5")
+
+counts.raw <- Read10X_h5("8256-SB-5/raw_feature_bc_matrix.h5")
+tools::md5sum("8256-SB-5/raw_feature_bc_matrix.h5")
+
+# Correcting for ambient RNA using DecontX
+sce <- SingleCellExperiment(list(counts = counts$`Gene Expression`))
+sce.raw <- SingleCellExperiment(list(counts = counts.raw$`Gene Expression`))
+
+sce <- decontX(sce, background = sce.raw)
+
+# Merging with HTOs to create Seurat object
+pbmc.hashtag <- CreateSeuratObject(counts = round(decontXcounts(sce)), min.cells = 3, min.features = 100)
+pbmc.hashtag[["percent.mt"]] <- PercentageFeatureSet(pbmc.hashtag, pattern = "^MT-")
+
+VlnPlot(pbmc.hashtag, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+ggsave("QC/Sample_5_Raw_VlnPlt.png", dpi = 600)
+
+plot1 <- FeatureScatter(pbmc.hashtag, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(pbmc.hashtag, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+ggsave("QC/Sample_5_nFeatures_nCount.png", dpi = 300, height = 7, width = 17)
+
+pbmc.hashtag[["HTO"]] <- CreateAssayObject(counts = counts.raw$`Antibody Capture`[,colnames(pbmc.hashtag)])
+pbmc.hashtag <- NormalizeData(pbmc.hashtag, assay = "HTO", normalization.method = "CLR")
+
+pbmc.hashtag <- HTODemux(pbmc.hashtag, assay = "HTO", positive.quantile = 0.99)
+
+# Number of singlets and multiplets
+table(pbmc.hashtag$HTO_classification.global)
+
+Idents(pbmc.hashtag) <- "HTO_maxID"
+RidgePlot(pbmc.hashtag, assay = "HTO", features = rownames(pbmc.hashtag[["HTO"]]), ncol = 3)
+ggsave("QC/Sample_5_HTO_ridgeplot.png", dpi = 300)
+
+# Filter out the multiplets
+Idents(pbmc.hashtag) <- "HTO_classification.global"
+pbmc.singlet <- subset(pbmc.hashtag, idents = "Singlet")
+
+VlnPlot(pbmc.singlet, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+ggsave("QC/Sample_5_Singlet_VlnPlt.png", dpi = 300)
+
+# Filter out poor quality cells using UMI, mtRNA, etc., metrics
+x <- (quantile(pbmc.singlet$nFeature_RNA, 0.75) + 1.5*IQR(pbmc.singlet$nFeature_RNA))
+y <- (quantile(pbmc.singlet$nCount_RNA, 0.75) + 1.5*IQR(pbmc.singlet$nCount_RNA))
+
+# Selected 10% mtRNA cut-off based on literature review ranging from ~5-15% for PBMCs
+pbmc.singlet <- subset(pbmc.singlet,
+                       subset = nFeature_RNA > 100 & nFeature_RNA < x & nCount_RNA < y & percent.mt < 10)
+
+# Confirm that HTO classification is the same as the hash ID
+all(pbmc.singlet@meta.data$HTO_classification == pbmc.singlet@meta.data$hash.ID)
+
+# Add a barcode column (copied from rownames)
+pbmc.singlet@meta.data <- pbmc.singlet@meta.data %>% rownames_to_column(var = "barcodes") %>%
+  mutate(barcode = barcodes) %>%
+  column_to_rownames(var = "barcodes")
+
+# Add sample ID information based on HTO antibodies
+pbmc.singlet@meta.data <- pbmc.singlet@meta.data %>%
+  dplyr::mutate(
+    Sample_ID = case_when(
+      HTO_classification == "C0251" ~ "CVD_041",
+      HTO_classification == "C0252" ~ "CVD_023",
+      HTO_classification == "C0253" ~ "CVD_024",
+      HTO_classification == "C0254" ~ "CVD_025",
+      HTO_classification == "C0255" ~ "CVD_021"
+    ))
+
+saveRDS(pbmc.singlet, "Processing_RDS_files/2024_decontX_sample_5.rds")
+
+# Clear the global environment to preserve memory
+rm(list=ls())
+gc()
+```
+
+Sample 6:
+```{r}
+counts <- Read10X_h5("8256-SB-6/filtered_feature_bc_matrix.h5")
+tools::md5sum("8256-SB-6/filtered_feature_bc_matrix.h5")
+
+counts.raw <- Read10X_h5("8256-SB-6/raw_feature_bc_matrix.h5")
+tools::md5sum("8256-SB-6/raw_feature_bc_matrix.h5")
+
+# Correcting for ambient RNA using DecontX
+sce <- SingleCellExperiment(list(counts = counts$`Gene Expression`))
+sce.raw <- SingleCellExperiment(list(counts = counts.raw$`Gene Expression`))
+
+sce <- decontX(sce, background = sce.raw)
+
+# Merging with HTOs to create Seurat object
+pbmc.hashtag <- CreateSeuratObject(counts = round(decontXcounts(sce)), min.cells = 3, min.features = 100)
+pbmc.hashtag[["percent.mt"]] <- PercentageFeatureSet(pbmc.hashtag, pattern = "^MT-")
+
+VlnPlot(pbmc.hashtag, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+ggsave("QC/Sample_6_Raw_VlnPlt.png", dpi = 600)
+
+plot1 <- FeatureScatter(pbmc.hashtag, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(pbmc.hashtag, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+ggsave("QC/Sample_6_nFeatures_nCount.png", dpi = 300, height = 7, width = 17)
+
+pbmc.hashtag[["HTO"]] <- CreateAssayObject(counts = counts.raw$`Antibody Capture`[,colnames(pbmc.hashtag)])
+pbmc.hashtag <- NormalizeData(pbmc.hashtag, assay = "HTO", normalization.method = "CLR")
+
+pbmc.hashtag <- HTODemux(pbmc.hashtag, assay = "HTO", positive.quantile = 0.99)
+
+# Number of singlets and multiplets
+table(pbmc.hashtag$HTO_classification.global)
+
+Idents(pbmc.hashtag) <- "HTO_maxID"
+RidgePlot(pbmc.hashtag, assay = "HTO", features = rownames(pbmc.hashtag[["HTO"]]), ncol = 3)
+ggsave("QC/Sample_6_HTO_ridgeplot.png", dpi = 300)
+
+# Filter out the multiplets
+Idents(pbmc.hashtag) <- "HTO_classification.global"
+pbmc.singlet <- subset(pbmc.hashtag, idents = "Singlet")
+
+VlnPlot(pbmc.singlet, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+ggsave("QC/Sample_6_Singlet_VlnPlt.png", dpi = 300)
+
+# Filter out poor quality cells using UMI, mtRNA, etc., metrics
+x <- (quantile(pbmc.singlet$nFeature_RNA, 0.75) + 1.5*IQR(pbmc.singlet$nFeature_RNA))
+y <- (quantile(pbmc.singlet$nCount_RNA, 0.75) + 1.5*IQR(pbmc.singlet$nCount_RNA))
+
+# Selected 10% mtRNA cut-off based on literature review ranging from ~5-15% for PBMCs
+pbmc.singlet <- subset(pbmc.singlet,
+                       subset = nFeature_RNA > 100 & nFeature_RNA < x & nCount_RNA < y & percent.mt < 10)
+
+# Confirm that HTO classification is the same as the hash ID
+all(pbmc.singlet@meta.data$HTO_classification == pbmc.singlet@meta.data$hash.ID)
+
+# Add a barcode column (copied from rownames)
+pbmc.singlet@meta.data <- pbmc.singlet@meta.data %>% rownames_to_column(var = "barcodes") %>%
+  mutate(barcode = barcodes) %>%
+  column_to_rownames(var = "barcodes")
+
+# Add sample ID information based on HTO antibodies
+pbmc.singlet@meta.data <- pbmc.singlet@meta.data %>%
+  dplyr::mutate(
+    Sample_ID = case_when(
+      HTO_classification == "C0251" ~ "CVD_031",
+      HTO_classification == "C0252" ~ "CVD_032",
+      HTO_classification == "C0253" ~ "CVD_017",
+      HTO_classification == "C0254" ~ "CVD_018",
+      HTO_classification == "C0255" ~ "CVD_019"
+    ))
+
+saveRDS(pbmc.singlet, "Processing_RDS_files/2024_decontX_sample_6.rds")
+
+# Clear the global environment to preserve memory
+rm(list=ls())
+gc()
+```
+
+Sample 7:
+```{r}
+counts <- Read10X_h5("8256-SB-7/filtered_feature_bc_matrix.h5")
+tools::md5sum("8256-SB-7/filtered_feature_bc_matrix.h5")
+
+counts.raw <- Read10X_h5("8256-SB-7/raw_feature_bc_matrix.h5")
+tools::md5sum("8256-SB-7/raw_feature_bc_matrix.h5")
+
+# Correcting for ambient RNA using DecontX
+sce <- SingleCellExperiment(list(counts = counts$`Gene Expression`))
+sce.raw <- SingleCellExperiment(list(counts = counts.raw$`Gene Expression`))
+
+sce <- decontX(sce, background = sce.raw)
+
+# Merging with HTOs to create Seurat object
+pbmc.hashtag <- CreateSeuratObject(counts = round(decontXcounts(sce)), min.cells = 3, min.features = 100)
+pbmc.hashtag[["percent.mt"]] <- PercentageFeatureSet(pbmc.hashtag, pattern = "^MT-")
+
+VlnPlot(pbmc.hashtag, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+ggsave("QC/Sample_7_Raw_VlnPlt.png", dpi = 600)
+
+plot1 <- FeatureScatter(pbmc.hashtag, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(pbmc.hashtag, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+ggsave("QC/Sample_7_nFeatures_nCount.png", dpi = 300, height = 7, width = 17)
+
+pbmc.hashtag[["HTO"]] <- CreateAssayObject(counts = counts.raw$`Antibody Capture`[,colnames(pbmc.hashtag)])
+pbmc.hashtag <- NormalizeData(pbmc.hashtag, assay = "HTO", normalization.method = "CLR")
+
+pbmc.hashtag <- HTODemux(pbmc.hashtag, assay = "HTO", positive.quantile = 0.99)
+
+# Number of singlets and multiplets
+table(pbmc.hashtag$HTO_classification.global)
+
+Idents(pbmc.hashtag) <- "HTO_maxID"
+RidgePlot(pbmc.hashtag, assay = "HTO", features = rownames(pbmc.hashtag[["HTO"]]), ncol = 3)
+ggsave("QC/Sample_7_HTO_ridgeplot.png", dpi = 300)
+
+# Filter out the multiplets
+Idents(pbmc.hashtag) <- "HTO_classification.global"
+pbmc.singlet <- subset(pbmc.hashtag, idents = "Singlet")
+
+VlnPlot(pbmc.singlet, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+ggsave("QC/Sample_7_Singlet_VlnPlt.png", dpi = 300)
+
+# Filter out poor quality cells using UMI, mtRNA, etc., metrics
+x <- (quantile(pbmc.singlet$nFeature_RNA, 0.75) + 1.5*IQR(pbmc.singlet$nFeature_RNA))
+y <- (quantile(pbmc.singlet$nCount_RNA, 0.75) + 1.5*IQR(pbmc.singlet$nCount_RNA))
+
+# Selected 10% mtRNA cut-off based on literature review ranging from ~5-15% for PBMCs
+pbmc.singlet <- subset(pbmc.singlet,
+                       subset = nFeature_RNA > 100 & nFeature_RNA < x & nCount_RNA < y & percent.mt < 10)
+
+# Confirm that HTO classification is the same as the hash ID
+all(pbmc.singlet@meta.data$HTO_classification == pbmc.singlet@meta.data$hash.ID)
+
+# Add a barcode column (copied from rownames)
+pbmc.singlet@meta.data <- pbmc.singlet@meta.data %>% rownames_to_column(var = "barcodes") %>%
+  mutate(barcode = barcodes) %>%
+  column_to_rownames(var = "barcodes")
+
+# Add sample ID information based on HTO antibodies
+pbmc.singlet@meta.data <- pbmc.singlet@meta.data %>%
+  dplyr::mutate(
+    Sample_ID = case_when(
+      HTO_classification == "C0251" ~ "CVD_026",
+      HTO_classification == "C0252" ~ "CVD_027",
+      HTO_classification == "C0253" ~ "CVD_028",
+      HTO_classification == "C0254" ~ "CVD_029",
+      HTO_classification == "C0255" ~ "CVD_030"
+    ))
+
+saveRDS(pbmc.singlet, "Processing_RDS_files/2024_decontX_sample_7.rds")
+
+# Clear the global environment to preserve memory
+rm(list=ls())
+gc()
+```
+
+Sample 8:
+```{r}
+counts <- Read10X_h5("8256-SB-8/filtered_feature_bc_matrix.h5")
+tools::md5sum("8256-SB-8/filtered_feature_bc_matrix.h5")
+
+counts.raw <- Read10X_h5("8256-SB-8/raw_feature_bc_matrix.h5")
+tools::md5sum("8256-SB-8/raw_feature_bc_matrix.h5")
+
+# Correcting for ambient RNA using DecontX
+sce <- SingleCellExperiment(list(counts = counts$`Gene Expression`))
+sce.raw <- SingleCellExperiment(list(counts = counts.raw$`Gene Expression`))
+
+sce <- decontX(sce, background = sce.raw)
+
+# Merging with HTOs to create Seurat object
+pbmc.hashtag <- CreateSeuratObject(counts = round(decontXcounts(sce)), min.cells = 3, min.features = 100)
+pbmc.hashtag[["percent.mt"]] <- PercentageFeatureSet(pbmc.hashtag, pattern = "^MT-")
+
+VlnPlot(pbmc.hashtag, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+ggsave("QC/Sample_8_Raw_VlnPlt.png", dpi = 600)
+
+plot1 <- FeatureScatter(pbmc.hashtag, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(pbmc.hashtag, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+ggsave("QC/Sample_8_nFeatures_nCount.png", dpi = 300, height = 7, width = 17)
+
+pbmc.hashtag[["HTO"]] <- CreateAssayObject(counts = counts.raw$`Antibody Capture`[,colnames(pbmc.hashtag)])
+pbmc.hashtag <- NormalizeData(pbmc.hashtag, assay = "HTO", normalization.method = "CLR")
+
+pbmc.hashtag <- HTODemux(pbmc.hashtag, assay = "HTO", positive.quantile = 0.99)
+
+# Number of singlets and multiplets
+table(pbmc.hashtag$HTO_classification.global)
+
+Idents(pbmc.hashtag) <- "HTO_maxID"
+RidgePlot(pbmc.hashtag, assay = "HTO", features = rownames(pbmc.hashtag[["HTO"]]), ncol = 3)
+ggsave("QC/Sample_8_HTO_ridgeplot.png", dpi = 300)
+
+# Filter out the multiplets
+Idents(pbmc.hashtag) <- "HTO_classification.global"
+pbmc.singlet <- subset(pbmc.hashtag, idents = "Singlet")
+
+VlnPlot(pbmc.singlet, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+ggsave("QC/Sample_8_Singlet_VlnPlt.png", dpi = 300)
+
+# Filter out poor quality cells using UMI, mtRNA, etc., metrics
+x <- (quantile(pbmc.singlet$nFeature_RNA, 0.75) + 1.5*IQR(pbmc.singlet$nFeature_RNA))
+y <- (quantile(pbmc.singlet$nCount_RNA, 0.75) + 1.5*IQR(pbmc.singlet$nCount_RNA))
+
+# Selected 10% mtRNA cut-off based on literature review ranging from ~5-15% for PBMCs
+pbmc.singlet <- subset(pbmc.singlet,
+                       subset = nFeature_RNA > 100 & nFeature_RNA < x & nCount_RNA < y & percent.mt < 10)
+
+# Confirm that HTO classification is the same as the hash ID
+all(pbmc.singlet@meta.data$HTO_classification == pbmc.singlet@meta.data$hash.ID)
+
+# Add a barcode column (copied from rownames)
+pbmc.singlet@meta.data <- pbmc.singlet@meta.data %>% rownames_to_column(var = "barcodes") %>%
+  mutate(barcode = barcodes) %>%
+  column_to_rownames(var = "barcodes")
+
+# Add sample ID information based on HTO antibodies
+pbmc.singlet@meta.data <- pbmc.singlet@meta.data %>%
+  dplyr::mutate(
+    Sample_ID = case_when(
+      HTO_classification == "C0251" ~ "CVD_014",
+      HTO_classification == "C0252" ~ "CVD_015",
+      HTO_classification == "C0253" ~ "CVD_016",
+      HTO_classification == "C0254" ~ "CVD_020",
+      HTO_classification == "C0255" ~ "CVD_022"
+    ))
+
+saveRDS(pbmc.singlet, "Processing_RDS_files/2024_decontX_sample_8.rds")
+
+# Clear the global environment to preserve memory
+rm(list=ls())
+gc()
+```
+## Doublet removal
+Now that we created all the Seurat objects for the 8 individual batches and demultiplexed the samples, we will now further filter for doublets/multiplets and remove them.
+
+At the end of this, a single file will be generated that will contain all the merged samples along with the metadata for each patient.
+
+Within each step of doublet filtering, I will load the previously-created rds files, convert them to SingleCellExperiment format, and perform doublet detection PER SAMPLE ID (not entire batch) using scDblFinder. Then, I will convert back to 
+
+```{r}
+set.seed(1) # Since scDblFinder relies on the partly random generation of artificial doublets, running scDblFinder multiple times on the same data will yield slightly different results
+
+# Load the metadata
+meta <- read_csv("pbmc_metadata.csv")
+tools::md5sum("pbmc_metadata.csv")
+
+# Sample 1
+sample_1 <- read_rds("Processing_RDS_files/2024_decontX_sample_1.rds")
+tools::md5sum("Processing_RDS_files/2024_decontX_sample_1.rds")
+
+sample_1_sce <- as.SingleCellExperiment(sample_1)
+
+sce_1 <- scDblFinder(sample_1_sce, samples = "Sample_ID")
+table(sce_1$scDblFinder.class, sce_1$scDblFinder.sample)
+
+sce_1_seurat <- as.Seurat(sce_1)
+DefaultAssay(sce_1_seurat) <- "RNA"
+
+sce_1_seurat <- subset(sce_1_seurat, subset = scDblFinder.class == "singlet")
+sce_1_seurat@meta.data <- left_join(sce_1_seurat@meta.data,
+                                    meta,
+                                    by = "Sample_ID")
+
+# Sample 2
+sample_2 <- read_rds("Processing_RDS_files/2024_decontX_sample_2.rds")
+sample_2_sce <- as.SingleCellExperiment(sample_2)
+
+sce_2 <- scDblFinder(sample_2_sce, samples = "Sample_ID")
+table(sce_2$scDblFinder.class, sce_2$scDblFinder.sample)
+
+sce_2_seurat <- as.Seurat(sce_2)
+DefaultAssay(sce_2_seurat) <- "RNA"
+
+sce_2_seurat <- subset(sce_2_seurat, subset = scDblFinder.class == "singlet")
+sce_2_seurat@meta.data <- left_join(sce_2_seurat@meta.data,
+                                    meta,
+                                    by = "Sample_ID")
+
+# Sample 3
+sample_3 <- read_rds("Processing_RDS_files/2024_decontX_sample_3.rds")
+sample_3_sce <- as.SingleCellExperiment(sample_3)
+
+sce_3 <- scDblFinder(sample_3_sce, samples = "Sample_ID")
+table(sce_3$scDblFinder.class, sce_3$scDblFinder.sample)
+
+sce_3_seurat <- as.Seurat(sce_3)
+DefaultAssay(sce_3_seurat) <- "RNA"
+
+sce_3_seurat <- subset(sce_3_seurat, subset = scDblFinder.class == "singlet")
+sce_3_seurat@meta.data <- left_join(sce_3_seurat@meta.data,
+                                    meta,
+                                    by = "Sample_ID")
+
+# Sample 4
+sample_4 <- read_rds("Processing_RDS_files/2024_decontX_sample_4.rds")
+sample_4_sce <- as.SingleCellExperiment(sample_4)
+
+sce_4 <- scDblFinder(sample_4_sce, samples = "Sample_ID")
+table(sce_4$scDblFinder.class, sce_4$scDblFinder.sample)
+
+sce_4_seurat <- as.Seurat(sce_4)
+DefaultAssay(sce_4_seurat) <- "RNA"
+
+sce_4_seurat <- subset(sce_4_seurat, subset = scDblFinder.class == "singlet")
+sce_4_seurat@meta.data <- left_join(sce_4_seurat@meta.data,
+                                    meta,
+                                    by = "Sample_ID")
+
+# Sample 5
+sample_5 <- read_rds("Processing_RDS_files/2024_decontX_sample_5.rds")
+sample_5_sce <- as.SingleCellExperiment(sample_5)
+
+sce_5 <- scDblFinder(sample_5_sce, samples = "Sample_ID")
+table(sce_5$scDblFinder.class, sce_5$scDblFinder.sample)
+
+sce_5_seurat <- as.Seurat(sce_5)
+DefaultAssay(sce_5_seurat) <- "RNA"
+
+sce_5_seurat <- subset(sce_5_seurat, subset = scDblFinder.class == "singlet")
+sce_5_seurat@meta.data <- left_join(sce_5_seurat@meta.data,
+                                    meta,
+                                    by = "Sample_ID")
+
+# Sample 6
+sample_6 <- read_rds("Processing_RDS_files/2024_decontX_sample_6.rds")
+sample_6_sce <- as.SingleCellExperiment(sample_6)
+
+sce_6 <- scDblFinder(sample_6_sce, samples = "Sample_ID")
+table(sce_6$scDblFinder.class, sce_6$scDblFinder.sample)
+
+sce_6_seurat <- as.Seurat(sce_6)
+DefaultAssay(sce_6_seurat) <- "RNA"
+
+sce_6_seurat <- subset(sce_6_seurat, subset = scDblFinder.class == "singlet")
+sce_6_seurat@meta.data <- left_join(sce_6_seurat@meta.data,
+                                    meta,
+                                    by = "Sample_ID")
+
+# Sample 7
+sample_7 <- read_rds("Processing_RDS_files/2024_decontX_sample_7.rds")
+sample_7_sce <- as.SingleCellExperiment(sample_7)
+
+sce_7 <- scDblFinder(sample_7_sce, samples = "Sample_ID")
+table(sce_7$scDblFinder.class, sce_7$scDblFinder.sample)
+
+sce_7_seurat <- as.Seurat(sce_7)
+DefaultAssay(sce_7_seurat) <- "RNA"
+
+sce_7_seurat <- subset(sce_7_seurat, subset = scDblFinder.class == "singlet")
+sce_7_seurat@meta.data <- left_join(sce_7_seurat@meta.data,
+                                    meta,
+                                    by = "Sample_ID")
+
+# Sample 8
+sample_8 <- read_rds("Processing_RDS_files/2024_decontX_sample_8.rds")
+sample_8_sce <- as.SingleCellExperiment(sample_8)
+
+sce_8 <- scDblFinder(sample_8_sce, samples = "Sample_ID")
+table(sce_8$scDblFinder.class, sce_8$scDblFinder.sample)
+
+sce_8_seurat <- as.Seurat(sce_8)
+DefaultAssay(sce_8_seurat) <- "RNA"
+
+sce_8_seurat <- subset(sce_8_seurat, subset = scDblFinder.class == "singlet")
+sce_8_seurat@meta.data <- left_join(sce_8_seurat@meta.data,
+                                    meta,
+                                    by = "Sample_ID")
+
+# Clear some memory
+gc()
+```
+
+Add batch data and merge files together:
+```{r}
+# Adding batch
+sce_1_seurat@meta.data$batch <- "batch_1"
+
+sce_2_seurat@meta.data$batch <- "batch_2"
+
+sce_3_seurat@meta.data$batch <- "batch_3"
+
+sce_4_seurat@meta.data$batch <- "batch_4"
+
+sce_5_seurat@meta.data$batch <- "batch_5"
+
+sce_6_seurat@meta.data$batch <- "batch_6"
+
+sce_7_seurat@meta.data$batch <- "batch_7"
+
+sce_8_seurat@meta.data$batch <- "batch_8"
+
+# All 8 merged samples
+pbmc.combined <- merge(sce_1_seurat, y =
+                         c(sce_2_seurat,
+                           sce_3_seurat,
+                           sce_4_seurat,
+                           sce_5_seurat,
+                           sce_6_seurat,
+                           sce_7_seurat,
+                           sce_8_seurat))
+
+saveRDS(pbmc.combined, "Processing_RDS_files/2024_decontX_MERGED.rds")
+
+# Clear the global environment to preserve memory
+rm(list=ls())
+gc()
+```
+
+## Normalization, batch correction, and clustering - ALL SAMPLES
+In this section, I will process the merged objects as they typically are - all of them being processed at once with batch correction, etc.
+
+NOTE: I will be removing the immunoglobulins and TCR genes since this is 5' scRNA-seq and those are going to be highly variable - these genes will dominate the HVGs that are selected otherwise.
+
+```{r}
+# Loading data
+pbmc.combined <- readRDS("Processing_RDS_files/2024_decontX_MERGED.rds")
+
+# Removing TCR genes
+pbmc.combined <- pbmc.combined[!grepl("^TR[ABDG][VJC]", rownames(pbmc.combined)), ]
+
+# Removing BCR-genes
+pbmc.combined <- pbmc.combined[!grepl("^IG[HKL]V", rownames(pbmc.combined)), ]
+pbmc.combined <- pbmc.combined[!grepl("^IG[HKL]J", rownames(pbmc.combined)), ]
+pbmc.combined <- pbmc.combined[!grepl("^IG[KL]C", rownames(pbmc.combined)), ]
+pbmc.combined <- pbmc.combined[!grepl("^IGH[ADEGM]", rownames(pbmc.combined)), ]
+```
+
+Normalization, batch correction, and clustering
+
+```{r}
+# Clear memory
+gc()
+
+# SCTransform individual batches
+features <- SplitObject(pbmc.combined, split.by = "batch")
+
+features <- lapply(X = features,
+                   FUN = SCTransform,
+                   vst.flavor = "v2",
+                   method = "glmGamPoi",
+                   return.only.var.genes = FALSE)
+
+var.features <- SelectIntegrationFeatures(object.list = features, nfeatures = 3000)
+
+pbmc <- merge(x = features[[1]], y = features[2:length(features)], merge.data=TRUE)
+
+VariableFeatures(pbmc) <- var.features
+
+saveRDS(pbmc, "Processing_RDS_files/2024_pbmc_all_samples_postSCT.rds")
+
+# Remove objects and clear memory
+rm(list = ls())
+gc()
+```
+Next, I will perform PCA, batch-correct using Harmony, and cluster the samples. During Harmony batch-correction, each batch (i.e., each 5 individual samples multiplexed together will be considered a batch since within sample technical variation within that batch should be minimal) will be corrected.
+
+```{r}
+# Load file
+pbmc <- readRDS("Processing_RDS_files/2024_pbmc_all_samples_postSCT.rds")
+
+# Batch correction with Harmony
+pbmc_correct <- RunPCA(pbmc, verbose = TRUE)
+pbmc_correct <- RunHarmony(pbmc_correct, assay.use="SCT", group.by.vars = "batch")
+pbmc_correct <- RunUMAP(pbmc_correct, reduction = "harmony", dims = 1:30)
+pbmc_correct <- FindNeighbors(pbmc_correct, reduction = "harmony", dims = 1:30) %>% FindClusters(resolution = 0.4)
+
+DimPlot(pbmc_correct, label = TRUE)
+saveRDS(pbmc_correct, "Processing_RDS_files/2024_pbmc_ALL_samples_postprocessing.rds")
+
+# Clear global environment and memory
+rm(list = ls())
+gc()
+```
+## Work on the merged Harmony object that includes both CAV and controls
+```{r}
+pbmc <- readRDS("Processing_RDS_files/2024_pbmc_ALL_samples_postprocessing.rds")
+DimPlot(pbmc)
+
+# Find markers
+cluster.markers <- FindAllMarkers(pbmc,
+                                  assay = "RNA",
+                                  logfc.threshold = 0.25,
+                                  test.use = "wilcox",
+                                  min.pct = 0.1,
+                                  min.diff.pct = 0.1,
+                                  only.pos = TRUE)
+# write_csv(cluster.markers, "Processing_RDS_files/2024_pbmc_ALL_samples_cluster_markers.csv")
+```
+
+
+Further direct visualization:
+```{r}
+DimPlot(pbmc, label = TRUE)
+
+# Broad T cell markers
+plot_density(pbmc, features = c("CD3E", "CD3D", "CD8A", "CD8B"))
+
+# B cell
+FeaturePlot(pbmc, features = c("MS4A1", "CD79A"))
+
+# NK cells
+plot_density(pbmc, features = c("GNLY", "NKG7", "KLRD1"))
+
+# Monocytes
+plot_density(pbmc, features = c("CD14", "FCGR3A"))
+
+# Platelets
+plot_density(pbmc, features = c("PPBP"))
+
+# Dendritic markers
+FeaturePlot(pbmc, features = c("FCER1A", "CD1C", "FSCN1",
+                                       "ITGAX", "CD14", "CLEC7A",
+                                       "CLEC6A", "IL3RA", "CX3CR1",
+                                       "LILRA4", "CST3", "THBD"))
+
+# HSPC
+plot_density(pbmc, features = c("CD34"))
+```
+Based on above information, I can roughly categorize the clusters as follows:
+
+0 = "CD4+ T cells I",
+1 = "CD8+ T cells I",
+2 = "CD14+ monocytes I",
+3 = "CD14+ monocytes II",
+4 = "NK cells",
+5 = "B cells",
+6 = "CD16+ monocytes",
+7 = "CD4+ T cells II"
+8 = "CD8+ T cells II",
+9 = "Unknown",
+10 = "Unknown",
+11 = "Plasmacytoid dendritic cells",
+12 = "CD1c+ dendritic cells",
+13 = "CD4+ T cells III",
+14 = "Platelets"
+
+Below, I will reference map the pbmc_correct clusters (Control-only clusters) with that of a published PBMC scRNA-seq/CITE-seq dataset containing 162,000 cells and 228 antibodies - PMID: 34062119.
+```{r}
+satija_reference <- readRDS("pbmc_multimodal_2023.rds")
+
+# First, finding anchors between the datasets
+anchor <- FindTransferAnchors(
+  reference = satija_reference,
+  query = pbmc,
+  reference.reduction = "spca",
+  normalization.method = "SCT",
+  dims = 1:50
+)
+
+# Creating a new object for reference mapping
+pbmc_refmap <- MapQuery(
+  anchorset = anchor,
+  query = pbmc,
+  reference = satija_reference,
+  refdata = list(
+    celltype.l1 = "celltype.l1",
+    celltype.l2 = "celltype.l2"
+  ),
+  reference.reduction = "spca", 
+  reduction.model = "wnn.umap"
+)
+
+# Visualization based on the QUERY UMAP
+p1 = DimPlot(pbmc_refmap, reduction = "umap", group.by = "predicted.celltype.l1", label = TRUE, label.size = 3, repel = TRUE)
+p2 = DimPlot(pbmc_refmap, reduction = "umap", group.by = "predicted.celltype.l2", label = TRUE, label.size = 3 ,repel = TRUE)
+p1 + p2
+
+# Clear global environment (except pbmc_refmap) and memory
+rm(list = setdiff(ls(), "pbmc_refmap"))
+gc()
+```
+
+I will work with this annotated dataset for downstream analyses:
+```{r}
+saveRDS(pbmc_refmap, "Processing_RDS_files/2024_pbmc_ALL_samples_postANNOTATION.rds")
+DimPlot(pbmc_refmap, group.by = "predicted.celltype.l2")
+```
+
+## Visualization for manuscript
+
+First, reloading object:
+```{r}
+# Load Seurat object
+pbmc <- readRDS("Processing_RDS_files/2024_pbmc_ALL_samples_postANNOTATION.rds")
+
+# Rename two metadata columns for easier downstream analyses
+pbmc@meta.data <- pbmc@meta.data %>% dplyr::rename(
+  cluster = predicted.celltype.l1,
+  subcluster = predicted.celltype.l2
+)
+
+pbmc@meta.data <- pbmc@meta.data %>%
+  mutate(
+    cluster = case_when(
+      cluster == "B" ~ "B cells",
+      cluster == "CD4 T" ~ "CD4+ T cells",
+      cluster == "CD8 T" ~ "CD8+ T cells",
+      cluster == "DC" ~ "Dendritic cells",
+      cluster == "Mono" ~ "Monocytes",
+      cluster == "NK" ~ "NK cells",
+      cluster == "other" ~ "Other",
+      cluster == "other T" ~ "Other T cells"
+    )
+  )
+
+# Clear memory
+gc()
+```
+
+Now, working on some figures:
+```{r}
+# Clusters
+custom_colors_CLUSTER <- c(
+  "#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00",
+  "#FFD700", "#A65628", "#999999"
+)
+
+DimPlot(pbmc, group.by = "cluster") +
+  ggtitle(NULL) +
+  NoAxes() +
+  scale_color_manual(values = custom_colors_CLUSTER)
+# ggsave("Figures/Dimplot_cluster.png", dpi = 1200, bg = "white")
+
+# Subclusters - need 31 colors
+colors1 <- brewer.pal(12, "Set3")
+colors2 <- brewer.pal(8, "Set1")
+colors3 <- brewer.pal(9, "Set2")
+colors4 <- brewer.pal(9, "Paired")
+extra.colors <- c("#66C2A5", "#FC8D62", "#8DA0CB", "#E78AC3", "#A6D854", "#FFD92F")
+
+# Combine and select unique colors to make sure we have 31 distinct colors
+custom_colors_SUBCLUSTER <- unique(c(colors1, colors2, colors3, colors4, extra.colors))
+
+DimPlot(pbmc, group.by = "subcluster") +
+  ggtitle(NULL) +
+  NoAxes() +
+  scale_color_manual(values = custom_colors_SUBCLUSTER)
+# ggsave("Figures/Dimplot_SUBcluster.png", dpi = 1200, bg = "white", width = 10)
+```
+
+Marker genes:
+```{r}
+# Broad cluster markers
+Idents(pbmc) <- pbmc$cluster
+
+cluster.markers <- FindAllMarkers(pbmc,
+                          assay = "RNA",
+                          only.pos = TRUE,
+                          test.use = "wilcox")
+
+# Subcluster markers
+Idents(pbmc) <- pbmc$subcluster
+
+subcluster.markers <- FindAllMarkers(pbmc,
+                                     assay = "RNA",
+                                     only.pos = TRUE,
+                                     test.use = "wilcox")
+
+# Save files
+# write_csv(cluster.markers, "QC/Cluster_markers.csv")
+# write_csv(subcluster.markers, "QC/Subcluster_markers.csv")
+
+# Visualize markers
+cluster.markers.top <- cluster.markers %>%
+  dplyr::distinct(gene, .keep_all = TRUE) %>%
+  group_by(cluster) %>%
+  slice_head(n = 5)
+
+cluster.markers.top.manual <- c(cluster.markers.top$gene, "CD8A", "CD3D", "CD3G", "CD14", "FCGR3A", "GNLY", "GZMB", "S100A4", "CST3")
+
+DotPlot(pbmc,
+        assay = "RNA",
+        features = cluster.markers.top.manual,
+        group.by = "cluster") +
+  scale_color_viridis_b() +
+guides(color = guide_colorbar(title = 'Average scaled \nexpression')) +
+  RotatedAxis() +
+  xlab("Gene") +
+  ylab("Cluster")
+# ggsave("Figures/Dotplot_clusters.png", dpi = 1200, bg = "white", width = 14)
+
+# I want to cluster these genes manually for downstream visualization ease
+reordered_genes <- c(
+  "CD3D", "CD3G", "CD8A", "CD8B", 
+  "IL7R", "GNLY", "NKG7", "GZMB", 
+  "CD14", "FCGR3A", "S100A4", "S100A8",
+  "FCER1A", "CST3", 
+  "CD79A", "MS4A1", "CD37", "HLA-DQA1", 
+  "BANK1", "LTB", "LDHB", "IL32", 
+  "RPS12", "CCL5", "GZMH", "CST7", 
+  "PTGDS", "PPP1R14B", "IRF7", "PLD4", 
+  "S100A9", "LYZ", "FTL", "IFI30", 
+  "SPON2", "CD247", "KLRF1", "IL2RB", 
+  "XCL2", "PPBP", "TUBB1", "GP1BB", 
+  "PF4", "GNG11", "KLRB1", "NCR3", 
+  "SLC4A10", "CXCR4", "RORA"
+)
+
+DotPlot(pbmc,
+        assay = "RNA",
+        features = reordered_genes,
+        group.by = "cluster") +
+  scale_color_viridis_b() +
+guides(color = guide_colorbar(title = 'Average scaled \nexpression')) +
+  RotatedAxis() +
+  xlab("Gene") +
+  ylab("Cluster")
+# ggsave("Figures/Dotplot_clusters_reordered.png", dpi = 1200, bg = "white", width = 14)
+
+# Now, I'll reorder the clusters also to make visualization easier
+Idents(pbmc) <- pbmc$cluster
+pbmc_reordered <- pbmc
+
+new_levels <- c("Other", "B cells", "Dendritic cells", "Monocytes",
+                "NK cells", "Other T cells", "CD8+ T cells", "CD4+ T cells")
+  
+  c("CD4+ T cells", "CD8+ T cells", "Other T cells", "NK cells", 
+                "Monocytes", "Dendritic cells", "B cells", "Other")
+
+# Reorder the levels
+pbmc_reordered$ordered_clusters <- factor(pbmc_reordered$cluster, levels = c(new_levels))
+
+DotPlot(pbmc_reordered,
+        assay = "RNA",
+        features = reordered_genes,
+        group.by = "ordered_clusters") +
+  scale_color_viridis_b() +
+guides(color = guide_colorbar(title = 'Average scaled \nexpression')) +
+  RotatedAxis() +
+  xlab("Gene") +
+  ylab("Cluster")
+
+# ggsave("Figures/Dotplot_clusters_reordered_clusters.png", dpi = 1200, bg = "white", width = 14)
+```

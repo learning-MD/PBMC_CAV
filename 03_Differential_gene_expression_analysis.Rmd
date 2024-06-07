@@ -1,0 +1,135 @@
+---
+title: "PBMC CAV Different gene expression"
+author: "Kaushik Amancherla"
+date: "2024-03-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(Seurat)
+library(miloDE)
+library(miloR)
+library(SingleCellExperiment)
+library(S4Vectors)
+library(BiocParallel)
+library(ggpubr)
+library(gprofiler2)
+
+# Set working directory
+setwd("C:/Users/amanchk/Downloads/PBMC_CAV_2.2024")
+```
+
+## Load PBMC CAV Seurat object and convert to SCE
+
+Here, I am just loading the object that I previously created. Once loaded, I will convert it to a SingleCellExperiment (SCE) object that can be used for downstream analyses.
+
+```{r}
+# Load Seurat object
+pbmc <- readRDS("Processing_RDS_files/2024_pbmc_ALL_samples_postANNOTATION.rds")
+
+# Rename two metadata columns for easier downstream analyses
+pbmc@meta.data <- pbmc@meta.data %>% rename(
+  cluster = predicted.celltype.l1,
+  subcluster = predicted.celltype.l2
+)
+
+# Convert the Seurat object to an SCE object
+pbmc.sce <- as.SingleCellExperiment(pbmc, assay = "RNA")
+pbmc.sce
+```
+
+## Cluster-free DGE
+
+First, we will estaimate neighborhood size to determine the optimal k to assign.
+
+```{r}
+stat_k = estimate_neighbourhood_sizes(pbmc.sce, k_grid = seq(10,40,5) , 
+                                      order = 2, prop = 0.1 , filtering = TRUE,
+                                      reducedDim_name = "HARMONY" , plot_stat = TRUE)
+
+knitr::kable(stat_k , caption = "Neighbourhood size distribution ~ k")
+```
+
+Based on the above, I will use k = 30 for neighborhood size.
+
+```{r}
+gc()
+set.seed(32)
+milo_pbmc <- assign_neighbourhoods(pbmc.sce, k=30, order = 2,
+                                   filtering = TRUE, reducedDim_name = "HARMONY")
+
+# saveRDS(milo_pbmc, "Processing_RDS_files/milo_DE/2024_miloDE_pbmc_harmony_k30.rds")
+
+gc()
+milo_pbmc_35 <- assign_neighbourhoods(pbmc.sce, k=35, order = 2,
+                                   filtering = TRUE, reducedDim_name = "HARMONY")
+
+# saveRDS(milo_pbmc, "Processing_RDS_files/milo_DE/2024_miloDE_pbmc_harmony_k35.rds")
+
+rm(list = setdiff(ls(), "milo_pbmc"))
+gc()
+```
+
+Next, I will evaluate DGE in prednisone as my positive control.
+
+```{r}
+stat_auc = suppressWarnings(calc_AUC_per_neighbourhood(milo_pbmc , sample_id = "Sample_ID" , condition_id = "prednisone", min_n_cells_per_sample = 1, BPPARAM = SnowParam(16)))
+saveRDS(stat_auc, "Processing_RDS_files/milo_DE/2024_stat_auc_prednisone_k30.rds")
+
+stat_auc_0.5 <- filter(stat_auc, auc > 0.5)
+
+gc()
+de_stat_prednisone = de_test_neighbourhoods(milo_pbmc , sample_id = "Sample_ID", 
+                                       design = ~prednisone, covariates = c("prednisone", "age", "sex"),
+                                       subset_nhoods = stat_auc_0.5$Nhood, BPPARAM = SnowParam(16))
+
+gc()
+```
+
+
+Save the above and run new code:
+
+```{r}
+gc()
+saveRDS(de_stat_prednisone, "Processing_RDS_files/milo_DE/2024_de_stat_prednisone_k30.rds")
+rm(de_stat_prednisone)
+
+rm(list = setdiff(ls(), "milo_pbmc"))
+gc()
+
+
+# For high-grade CAV
+stat_auc = suppressWarnings(calc_AUC_per_neighbourhood(milo_pbmc , sample_id = "Sample_ID" , condition_id = "high_grade_cav", min_n_cells_per_sample = 1, BPPARAM = SnowParam(16)))
+saveRDS(stat_auc, "Processing_RDS_files/milo_DE/2024_stat_auc_high_grade_k30.rds")
+
+stat_auc_0.5 <- filter(stat_auc, auc > 0.5)
+
+gc()
+de_stat_high = de_test_neighbourhoods(milo_pbmc , sample_id = "Sample_ID", 
+                                 design = ~high_grade_cav, covariates = c("high_grade_cav", "age", "sex", "prednisone"),
+                                 subset_nhoods = stat_auc_0.5$Nhood, BPPARAM = SnowParam(16))
+
+gc()
+saveRDS(de_stat_high, "Processing_RDS_files/milo_DE/2024_de_stat_high_grade_k30.rds")
+```
+
+Regular group:
+```{r}
+rm(list = setdiff(ls(), "milo_pbmc"))
+gc()
+
+stat_auc = suppressWarnings(calc_AUC_per_neighbourhood(milo_pbmc , sample_id = "Sample_ID" , condition_id = "group", min_n_cells_per_sample = 1, BPPARAM = SnowParam(16)))
+saveRDS(stat_auc, "Processing_RDS_files/milo_DE/2024_stat_auc_group_k30.rds")
+
+stat_auc_0.5 <- filter(stat_auc, auc > 0.5)
+
+gc()
+de_stat_group = de_test_neighbourhoods(milo_pbmc , sample_id = "Sample_ID", 
+                                      design = ~group, covariates = c("group", "age", "sex", "prednisone"),
+                                      subset_nhoods = stat_auc_0.5$Nhood, BPPARAM = SnowParam(16))
+
+gc()
+saveRDS(de_stat_group, "Processing_RDS_files/milo_DE/2024_de_stat_group_k30.rds")
+
+```
